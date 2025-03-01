@@ -28,6 +28,9 @@ import os
 import subprocess
 import re
 import colorama
+import paramiko
+from threading import Thread
+from socket import socket, AF_INET, SOCK_STREAM
 
 # Configure logging with cleaner output and colors
 colorama.init()
@@ -52,24 +55,25 @@ logger = logging.getLogger('dcopt')
 # Configuration
 CONFIG = {
     "ollama_url": "http://127.0.0.1:11434",  # Ollama URL
-    "proxy_port": 11435,                    # Proxy port
-    "model_name": "deepseek-r1:7b",         # Default model
-    "retry_count": 3,                       # Retries for failed requests
-    "retry_delay": 0.5,                     # Delay between retries
-    "use_ngrok": False,                     # Enable ngrok (disabled by default)
-    "ngrok_authtoken": "",                  # Your ngrok auth token
-    "request_timeout": 300,                 # Request timeout in seconds (5 minutes)
-    "max_buffer_size": 1024 * 1024 * 1000, # 50MB buffer for large responses
-    "chunk_size": 16384,                   # 16KB chunks for streaming
-    "max_retries_on_timeout": 2,           # Additional retries on timeout
-    "use_ssh": False,                      # Enable SSH tunneling
-    "ssh_host": "",                        # SSH host to connect to
-    "ssh_port": 22,                        # SSH port
-    "ssh_user": "",                        # SSH username
-    "ssh_password": "",                    # SSH password
-    "ssh_key_file": "",                    # SSH private key file (optional)
-    "ssh_remote_port": 11435,              # Remote port to forward to (same as proxy_port)
+    "proxy_port": 11435,                      # Proxy port
+    "model_name": "deepseek-r1:7b",          # Default model
+    "retry_count": 3,                         # Retries for failed requests
+    "retry_delay": 0.5,                       # Delay between retries
+    "use_ngrok": False,                       # Enable ngrok (disabled by default)
+    "ngrok_authtoken": "",                    # Your ngrok auth token
+    "request_timeout": 300,                   # Request timeout in seconds (5 minutes)
+    "max_buffer_size": 1024 * 1024 * 1000,   # 50MB buffer for large responses
+    "chunk_size": 16384,                      # 16KB chunks for streaming
+    "max_retries_on_timeout": 2,              # Additional retries on timeout
+    "use_ssh": False,                         # Enable SSH tunneling
+    "ssh_host": "",                           # SSH host to connect to
+    "ssh_port": 22,                           # SSH port
+    "ssh_user": "",                           # SSH username
+    "ssh_password": "",                       # SSH password
+    "ssh_key_file": "",                       # SSH private key file (optional)
+    "ssh_remote_port": 11435,                 # Remote port to forward to (same as proxy_port)
 }
+
 
 
 class CORSProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -497,13 +501,123 @@ def start_ngrok(port):
         return None
 
 
-def start_ssh_tunnel():
-    """Start SSH tunnel and return success status"""
-    logger.info("Starting SSH tunnel...")
+def start_paramiko_tunnel():
+    """Start SSH tunnel using Paramiko"""
+    logger.info("Starting Paramiko SSH tunnel...")
     
     try:
+        # Create a new SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Connect using either password or key file
+        if CONFIG["ssh_key_file"]:
+            try:
+                private_key = paramiko.RSAKey.from_private_key_file(CONFIG["ssh_key_file"])
+                ssh.connect(
+                    CONFIG["ssh_host"],
+                    port=CONFIG["ssh_port"],
+                    username=CONFIG["ssh_user"],
+                    pkey=private_key,
+                    timeout=10
+                )
+            except Exception as e:
+                logger.error(f"Failed to connect with key file: {e}")
+                return False
+        else:
+            try:
+                ssh.connect(
+                    CONFIG["ssh_host"],
+                    port=CONFIG["ssh_port"],
+                    username=CONFIG["ssh_user"],
+                    password=CONFIG["ssh_password"],
+                    timeout=10
+                )
+            except Exception as e:
+                logger.error(f"Failed to connect with password: {e}")
+                return False
+
+        # Create the tunnel
+        try:
+            transport = ssh.get_transport()
+            # Start the tunnel in a thread to keep it running
+            def tunnel_thread():
+                try:
+                    transport.request_port_forward("", CONFIG["ssh_remote_port"])
+                    while True:
+                        chan = transport.accept()
+                        if chan is None:
+                            continue
+                        thr = Thread(target=handler, args=(chan,))
+                        thr.setDaemon(True)
+                        thr.start()
+                except Exception as e:
+                    logger.error(f"Tunnel error: {e}")
+
+            def handler(chan):
+                try:
+                    sock = socket(AF_INET, SOCK_STREAM)
+                    sock.connect(("127.0.0.1", CONFIG["proxy_port"]))
+                    
+                    def forward(source, destination):
+                        try:
+                            while True:
+                                data = source.recv(1024)
+                                if not data:
+                                    break
+                                destination.send(data)
+                        except Exception:
+                            pass
+                        finally:
+                            source.close()
+                            destination.close()
+                    
+                    Thread(target=forward, args=(chan, sock)).start()
+                    Thread(target=forward, args=(sock, chan)).start()
+                except Exception as e:
+                    logger.error(f"Connection handler error: {e}")
+                    if chan:
+                        chan.close()
+
+            tunnel = Thread(target=tunnel_thread)
+            tunnel.daemon = True
+            tunnel.start()
+            
+            # Wait a bit to ensure tunnel is established
+            time.sleep(2)
+            
+            if transport.is_active():
+                logger.info("✓ Paramiko SSH tunnel established successfully")
+                logger.info(f"Your proxy is now accessible at: http://{CONFIG['ssh_host']}:{CONFIG['ssh_remote_port']}")
+                return True
+            else:
+                logger.error("Failed to establish Paramiko tunnel")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error setting up tunnel: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Paramiko error: {e}")
+        return False
+
+
+def start_ssh_tunnel():
+    """Start SSH tunnel using either Paramiko or system SSH"""
+    logger.info("Starting SSH tunnel...")
+    
+    # Try Paramiko first
+    try:
+        if start_paramiko_tunnel():
+            return True
+    except Exception as e:
+        logger.warning(f"Paramiko failed: {e}, falling back to system SSH")
+    
+    # Fall back to system SSH/plink
+    try:
         if sys.platform == 'win32':
-            # Use plink for Windows with proper remote forwarding
+            # Use plink for Windows
             ssh_cmd = [
                 "plink",
                 "-ssh",
@@ -511,19 +625,19 @@ def start_ssh_tunnel():
                 "-R", f"{CONFIG['ssh_remote_port']}:127.0.0.1:{CONFIG['proxy_port']}",
                 "-P", str(CONFIG['ssh_port']),
                 "-pw", CONFIG['ssh_password'],
-                "-batch",  # Avoid interactive prompts
+                "-batch",
                 f"{CONFIG['ssh_user']}@{CONFIG['ssh_host']}"
             ]
             logger.info("Using plink for Windows SSH connection")
         else:
-            # For non-Windows systems, use traditional SSH
+            # Use traditional SSH for Unix-like systems
             ssh_cmd = [
                 "ssh", "-N", 
                 "-R", f"{CONFIG['ssh_remote_port']}:127.0.0.1:{CONFIG['proxy_port']}",
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "ExitOnForwardFailure=yes",
                 "-o", "GatewayPorts=yes",
-                "-o", "ServerAliveInterval=60"  # Keep connection alive
+                "-o", "ServerAliveInterval=60"
             ]
             
             if CONFIG["ssh_key_file"]:
@@ -531,8 +645,7 @@ def start_ssh_tunnel():
                 
             ssh_cmd.append(f"{CONFIG['ssh_user']}@{CONFIG['ssh_host']}")
         
-        logger.info(f"Establishing SSH tunnel: {CONFIG['ssh_host']}:{CONFIG['ssh_remote_port']} <- Local proxy:{CONFIG['proxy_port']}")
-        logger.info(f"Command: {' '.join(ssh_cmd)}")
+        logger.info(f"Establishing system SSH tunnel: {CONFIG['ssh_host']}:{CONFIG['ssh_remote_port']} <- Local proxy:{CONFIG['proxy_port']}")
         
         # Start SSH process
         process = subprocess.Popen(
@@ -547,17 +660,16 @@ def start_ssh_tunnel():
         
         # Check if process is still running
         if process.poll() is None:
-            logger.info("✓ SSH tunnel established successfully")
+            logger.info("✓ System SSH tunnel established successfully")
             logger.info(f"Your proxy is now accessible at: http://{CONFIG['ssh_host']}:{CONFIG['ssh_remote_port']}")
-            logger.info("Use this URL in your Cursor settings")
             return True
         else:
             stderr = process.stderr.read().decode()
-            logger.error(f"Failed to establish SSH tunnel: {stderr}")
+            logger.error(f"Failed to establish system SSH tunnel: {stderr}")
             return False
             
     except Exception as e:
-        logger.error(f"Error establishing SSH tunnel: {e}")
+        logger.error(f"Error establishing system SSH tunnel: {e}")
         return False
 
 
