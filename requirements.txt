@@ -1,1 +1,4 @@
-colorama>=0.4.6 
+colorama>=0.4.6    # For cross-platform terminal colors
+paramiko>=3.4.0   # For SSH tunneling (primary method)
+pyngrok>=7.0.0    # For ngrok tunneling support
+cryptography>=42.0.0  # Required for paramiko SSH operations 
